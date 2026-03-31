@@ -18,7 +18,11 @@ import anthropic
 from datetime import datetime
 
 from templates import TEMPLATES
-from parser import parse_students, extract_text_from_docx, StudentSubmission
+from parser import (
+    parse_students, extract_text_from_docx, StudentSubmission,
+    process_file_by_type, extract_files_from_zip, process_multiple_files,
+    create_submission_from_file
+)
 from doc_generator import generate_feedback_docx
 
 
@@ -376,53 +380,155 @@ with tab_generator:
             st.session_state.assignment_ctx = ctx
 
         # File format instructions
-        st.markdown("### Upload Student Submissions")
+        st.markdown("### 📤 Upload Student Submissions")
 
         st.info(
-            f"📋 **Required File Format**\n\n"
-            f"{T['format_help']}\n\n"
+            f"📋 **Supported File Formats**\n\n"
+            f"✅ **Single file with all submissions:** .docx, .txt, .md, .pdf\n"
+            f"✅ **Individual student files:** .docx, .pdf, .pptx, .xlsx, .png, .jpg\n"
+            f"✅ **ZIP folder:** Upload entire Canvas export folder!\n\n"
+            f"**Format for combined files:**\n"
             f"```\n"
             f"Student: Jane Doe\n"
             f"[Jane's complete submission text here...]\n\n"
             f"Student: John Smith\n"
             f"[John's complete submission text here...]\n"
-            f"```"
+            f"```\n\n"
+            f"**For ZIP files:** Each file should be named with student name or contain 'Student: [Name]' header."
         )
 
-        uploaded_file = st.file_uploader(
-            "Choose a file (.docx, .txt, or .md)",
-            type=["docx", "txt", "md", "doc"],
-            help="Upload a single file containing all student submissions separated by 'Student: [Name]' headers.",
+        # Upload mode selection
+        upload_mode = st.radio(
+            "Upload Mode",
+            ["📄 Single File (all submissions)", "📁 Multiple Files", "🗜️ ZIP Folder (Canvas Export)"],
+            horizontal=True
         )
 
-        if uploaded_file is not None:
+        uploaded_files = []
+        
+        # ═══ SINGLE FILE MODE ═══
+        if upload_mode == "📄 Single File (all submissions)":
+            uploaded_file = st.file_uploader(
+                "Choose a file",
+                type=["docx", "txt", "md", "doc", "pdf"],
+                help="Upload a single file containing all student submissions separated by 'Student: [Name]' headers.",
+            )
+            if uploaded_file:
+                uploaded_files = [(uploaded_file.name, uploaded_file.getvalue())]
+        
+        # ═══ MULTIPLE FILES MODE ═══
+        elif upload_mode == "📁 Multiple Files":
+            uploaded_file_list = st.file_uploader(
+                "Choose files",
+                type=["docx", "txt", "md", "doc", "pdf", "pptx", "xlsx", "png", "jpg", "jpeg"],
+                accept_multiple_files=True,
+                help="Upload multiple files - one per student or containing multiple students each."
+            )
+            if uploaded_file_list:
+                uploaded_files = [(f.name, f.getvalue()) for f in uploaded_file_list]
+        
+        # ═══ ZIP MODE ═══
+        elif upload_mode == "🗜️ ZIP Folder (Canvas Export)":
+            uploaded_zip = st.file_uploader(
+                "Choose ZIP file",
+                type=["zip"],
+                help="Upload a ZIP folder containing all student submissions (e.g., Canvas export)."
+            )
+            if uploaded_zip:
+                try:
+                    zip_bytes = uploaded_zip.getvalue()
+                    extracted = extract_files_from_zip(zip_bytes)
+                    uploaded_files = [(fname, fbytes) for fname, fbytes, _ in extracted]
+                    st.success(f"✅ Extracted {len(uploaded_files)} files from ZIP")
+                except Exception as e:
+                    st.error(f"⚠️ Error extracting ZIP: {e}")
+
+        # ═══ PROCESS UPLOADED FILES ═══
+        if uploaded_files:
             try:
-                raw_bytes = uploaded_file.getvalue()
-                if uploaded_file.name.endswith(".docx"):
-                    raw_text = extract_text_from_docx(raw_bytes)
-                else:
-                    raw_text = raw_bytes.decode("utf-8", errors="replace")
-
-                students, error, pattern = parse_students(raw_text)
-
-                if error:
-                    st.error(f"⚠️ {error}")
-                    st.session_state.students = []
-                    st.session_state.parse_error = error
-                else:
-                    st.session_state.students = students
-                    st.session_state.parse_error = None
-                    st.session_state.pattern_used = pattern
-
-                    st.success(
-                        f"✅ **Found {len(students)} student{'s' if len(students) != 1 else ''}** "
-                        f"(detected via `{pattern}` pattern)"
-                    )
-                    st.markdown(
-                        "**Students found:** " + " · ".join(s.name for s in students)
-                    )
+                with st.spinner(f"Processing {len(uploaded_files)} file(s)..."):
+                    
+                    # Process files
+                    if len(uploaded_files) == 1:
+                        # Single file - traditional parsing
+                        filename, file_bytes = uploaded_files[0]
+                        raw_text, file_type = process_file_by_type(file_bytes, filename)
+                        
+                        if raw_text.startswith("⚠️"):
+                            st.error(raw_text)
+                            st.session_state.students = []
+                        else:
+                            students, error, pattern = parse_students(raw_text, filename)
+                            
+                            if error:
+                                st.error(f"⚠️ {error}")
+                                st.session_state.students = []
+                                st.session_state.parse_error = error
+                            else:
+                                st.session_state.students = students
+                                st.session_state.parse_error = None
+                                st.session_state.pattern_used = pattern
+                                
+                                st.success(
+                                    f"✅ **Found {len(students)} student{'s' if len(students) != 1 else ''}** "
+                                    f"(detected via `{pattern}` pattern)"
+                                )
+                                st.markdown(
+                                    "**Students found:** " + " · ".join(s.name for s in students)
+                                )
+                    
+                    else:
+                        # Multiple files - try two approaches
+                        st.info(f"📊 Processing {len(uploaded_files)} files...")
+                        
+                        # Approach 1: Try to find students in combined text
+                        combined_text, file_stats = process_multiple_files(uploaded_files)
+                        students, error, pattern = parse_students(combined_text, "multiple_files")
+                        
+                        # Approach 2: If no students found, treat each file as one student
+                        if error or len(students) == 0:
+                            st.warning("⚠️ Could not find 'Student: [Name]' headers. Treating each file as one student submission...")
+                            students = []
+                            for filename, file_bytes in uploaded_files:
+                                text, file_type = process_file_by_type(file_bytes, filename)
+                                if not text.startswith("⚠️") and len(text.strip()) > 10:
+                                    submission = create_submission_from_file(filename, text, file_type)
+                                    students.append(submission)
+                        
+                        # Show results
+                        if students:
+                            st.session_state.students = students
+                            st.session_state.parse_error = None
+                            st.session_state.pattern_used = pattern or "filename"
+                            
+                            # Show file stats
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("📁 Files Processed", file_stats['total'])
+                            with col2:
+                                st.metric("👥 Students Found", len(students))
+                            with col3:
+                                errors = file_stats.get('errors', 0)
+                                st.metric("⚠️ Errors", errors)
+                            
+                            # Show file types
+                            file_types_str = " · ".join([
+                                f"{ftype.upper()}: {count}" 
+                                for ftype, count in file_stats.items() 
+                                if ftype not in ['total', 'errors', 'unknown'] and count > 0
+                            ])
+                            if file_types_str:
+                                st.success(f"✅ **File types processed:** {file_types_str}")
+                            
+                            st.markdown(
+                                "**Students found:** " + " · ".join(s.name for s in students)
+                            )
+                        else:
+                            st.error("⚠️ No valid student submissions found in uploaded files.")
+                            st.session_state.students = []
+                
             except Exception as e:
-                st.error(f"⚠️ Error reading file: {e}")
+                st.error(f"⚠️ Error processing files: {e}")
                 st.session_state.students = []
 
         # Navigation
